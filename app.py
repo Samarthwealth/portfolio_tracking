@@ -1,3 +1,4 @@
+# portfolio_app.py
 import streamlit as st
 import pandas as pd
 import yfinance as yf
@@ -5,6 +6,8 @@ import sqlite3
 import matplotlib.pyplot as plt
 import os
 from fpdf import FPDF
+from io import BytesIO
+from datetime import datetime
 
 # Connect to SQLite DB
 conn = sqlite3.connect('portfolio.db', check_same_thread=False)
@@ -33,11 +36,13 @@ c.execute('''CREATE TABLE IF NOT EXISTS alerts (
     target_price REAL,
     stop_loss_price REAL)''')
 
-try:
-    c.execute("ALTER TABLE clients ADD COLUMN initial_cash REAL DEFAULT 0")
-    conn.commit()
-except sqlite3.OperationalError:
-    pass
+c.execute('''CREATE TABLE IF NOT EXISTS ledger (
+    ledger_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    client_name TEXT,
+    date TEXT,
+    description TEXT,
+    amount REAL
+)''')
 
 conn.commit()
 
@@ -49,6 +54,82 @@ def get_current_price(symbol):
         return round(data['Close'].iloc[-1], 2) if not data.empty else None
     except:
         return None
+
+def add_ledger_entry(client, date, description, amount):
+    c.execute("INSERT INTO ledger (client_name, date, description, amount) VALUES (?, ?, ?, ?)",
+              (client, str(date), description, amount))
+    conn.commit()
+
+def show_ledger(client):
+    st.subheader("📒 Ledger Entries")
+
+    # Fetch entries
+    df = pd.read_sql("SELECT * FROM ledger WHERE client_name = ? ORDER BY date DESC", conn, params=(client,))
+
+    if not df.empty:
+        st.dataframe(df)
+
+        # Compute total balance correctly (Deposit adds, Withdraw subtracts)
+        df['adjusted_amount'] = df.apply(
+            lambda row: row['amount'] if row['type'].lower() == 'deposit' else -row['amount'],
+            axis=1
+        )
+        total_balance = df['adjusted_amount'].sum()
+
+        st.markdown(f"**Total Balance**: ₹{total_balance:,.2f}")
+    else:
+        st.info("No ledger entries available.")
+
+
+def delete_client(client):
+    c.execute("DELETE FROM clients WHERE client_name = ?", (client,))
+    c.execute("DELETE FROM transactions WHERE client_name = ?", (client,))
+    c.execute("DELETE FROM alerts WHERE client_name = ?", (client,))
+    c.execute("DELETE FROM ledger WHERE client_name = ?", (client,))
+    conn.commit()
+
+# Sidebar: Add Client
+st.sidebar.header("➕ Add New Client")
+client_input = st.sidebar.text_input("Client Name", key="new_client")
+initial_cash = st.sidebar.number_input("Initial Cash (₹)", min_value=0.0, value=100000.0, key="initial_cash")
+
+if st.sidebar.button("Add Client", key="add_client_btn"):
+    try:
+        c.execute("INSERT INTO clients (client_name, initial_cash) VALUES (?, ?)", (client_input, initial_cash))
+        conn.commit()
+        add_ledger_entry(client_input, datetime.today().date(), "Initial Deposit", initial_cash)
+        st.sidebar.success(f"Client '{client_input}' added!")
+    except sqlite3.IntegrityError:
+        st.sidebar.error("Client already exists.")
+
+# Sidebar: Delete Client
+clients_list = pd.read_sql("SELECT client_name FROM clients", conn)['client_name'].tolist()
+if clients_list:
+    st.sidebar.header("❌ Delete Client")
+    client_to_delete = st.sidebar.selectbox("Select Client", clients_list, key="del_client")
+    if st.sidebar.button("Delete Selected Client", key="delete_btn"):
+        delete_client(client_to_delete)
+        st.sidebar.warning(f"Client '{client_to_delete}' deleted.")
+        st.experimental_rerun()
+
+# Main App Logic
+clients = pd.read_sql("SELECT client_name FROM clients", conn)['client_name'].tolist()
+selected_client = st.selectbox("Select Client", clients)
+
+if selected_client:
+    st.header(f"📥 Manage Portfolio for {selected_client}")
+
+    # Show Ledger
+    show_ledger(selected_client)
+
+    # Rest of your existing app code like transactions, alerts, insights, pdf generation...
+    # (You can append your previous implementation below this block)
+
+    # Example ledger entry
+    if st.button("Add Manual Ledger Entry"):
+        add_ledger_entry(selected_client, datetime.today().date(), "Manual Adjustment", 1000.0)
+        st.success("Ledger entry added.")
+        st.experimental_rerun()
 
 def calculate_realized_profit(client):
     df = pd.read_sql("SELECT * FROM transactions WHERE client_name = ?", conn, params=(client,))
@@ -96,21 +177,16 @@ def calculate_unrealized_profit(client):
     return pd.DataFrame(rows), round(unrealized, 2), round(invested, 2)
 
 st.title("📊 Stock Portfolio Tracker")
+# get ledger balance
+def get_ledger_balance(client):
+    df = pd.read_sql("SELECT * FROM ledger WHERE client_name = ?", conn, params=(client,))
+    if df.empty:
+        return 0.0
+    deposits = df[df["type"] == "Deposit"]["amount"].sum()
+    withdrawals = df[df["type"] == "Withdraw"]["amount"].sum()
+    return round(deposits - withdrawals, 2)
 
-st.sidebar.header("➕ Add New Client")
-client_input = st.sidebar.text_input("Client Name")
-initial_cash = st.sidebar.number_input("Initial Cash (₹)", min_value=0.0, value=100000.0)
 
-if st.sidebar.button("Add Client"):
-    try:
-        c.execute("INSERT INTO clients (client_name, initial_cash) VALUES (?, ?)", (client_input, initial_cash))
-        conn.commit()
-        st.sidebar.success(f"Client '{client_input}' added!")
-    except sqlite3.IntegrityError:
-        st.sidebar.error("Client already exists.")
-
-clients = pd.read_sql("SELECT client_name FROM clients", conn)['client_name'].tolist()
-selected_client = st.selectbox("Select Client", clients)
 
 if selected_client:
     st.header(f"📥 Add Transaction for {selected_client}")
@@ -205,16 +281,22 @@ if selected_client:
     else:
         initial_cash = 0.0
     net_value = realized + unrealized + invested
-    net_profit = net_value - initial_cash
-    net_pct = (net_profit / initial_cash) * 100 if initial_cash > 0 else 0
 
-    st.subheader("💰 Financial Summary")
+    ledger_balance = get_ledger_balance(selected_client)
+    realized = realized_df['Realized Profit'].sum() if not realized_df.empty else 0
+    net_profit = realized + unrealized
+    net_pct = (net_profit / ledger_balance) * 100 if ledger_balance else 0
+    net_value = invested + unrealized + realized
+    cash_available = ledger_balance - invested
+
     st.markdown(f"""
-- 🏦 **Initial Cash**: ₹{initial_cash:,.2f}  
-- 💸 **Cash Deployed**: ₹{invested:,.2f}  
-- 📈 **Net Portfolio Value**: ₹{net_value:,.2f}  
-- 💹 **Total Profit/Loss**: ₹{net_profit:,.2f} ({net_pct:+.2f}%)
-""")
+    - 🧾 **Ledger Balance (Cash In)**: ₹{ledger_balance:,.2f}  
+    - 💸 **Cash Deployed (Invested)**: ₹{invested:,.2f}  
+    - 💼 **Current Cash Available**: ₹{cash_available:,.2f}  
+    - 📈 **Net Portfolio Value**: ₹{net_value:,.2f}  
+    - 💹 **Total Profit/Loss**: ₹{net_profit:,.2f} ({net_pct:+.2f}%)
+    """)
+
 # Updated code combining portfolio tracker and downloadable PDF report with pie chart and Rs. format
 
 
@@ -270,25 +352,43 @@ class PDF(FPDF):
         self.set_font("Arial", "", 10)
         self.cell(0, 10, f"Generated on: {datetime.now().strftime('%d-%m-%Y %I:%M %p')}", ln=True, align="C")
         self.ln(5)
+
     def footer(self):
         self.set_y(-15)
         self.set_font("Arial", "I", 8)
         self.cell(0, 10, f'Page {self.page_no()}', align='C')
 
-def generate_pdf(client, realized_df, unreal_df, initial_cash, invested, net_value, net_profit, net_pct):
+
+def generate_pdf(client, realized_df, unreal_df, ledger_balance, invested, realized, unrealized):
+    net_value = invested + realized + unrealized
+    net_profit = realized + unrealized
+    net_pct = (net_profit / ledger_balance) * 100 if ledger_balance else 0
+    cash_available = ledger_balance - invested
+
     pdf = PDF()
     pdf.add_page()
     pdf.set_font("Arial", size=12)
 
     # Financial Summary
-    pdf.multi_cell(0, 8, f"Client: {client}\n\nFinancial Summary:\n- Initial Cash: Rs. {initial_cash:,.2f}\n- Cash Deployed: Rs. {invested:,.2f}\n- Net Portfolio Value: Rs. {net_value:,.2f}\n- Realized P&L: Rs. {realized_df['Realized Profit'].sum():,.2f}\n- Unrealized P&L: Rs. {net_value - invested - realized_df['Realized Profit'].sum():,.2f}\n- Net P&L: Rs. {net_profit:,.2f} ({net_pct:+.2f}%)")
+    pdf.set_font("Arial", "B", 12)
+    pdf.cell(0, 10, f"Client: {client}", ln=True)
+    pdf.set_font("Arial", size=11)
+    pdf.multi_cell(0, 8, f"""
+Financial Summary:
+- Ledger Balance (Cash In): Rs. {ledger_balance:,.2f}
+- Cash Deployed (Invested): Rs. {invested:,.2f}
+- Current Cash Available: Rs. {cash_available:,.2f}
+- Net Portfolio Value: Rs. {net_value:,.2f}
+- Realized P&L: Rs. {realized:,.2f}
+- Unrealized P&L: Rs. {unrealized:,.2f}
+- Total Profit/Loss: Rs. {net_profit:,.2f} ({net_pct:+.2f}%)
+""")
 
     # Realized Profit Table
     if not realized_df.empty:
-        pdf.ln(8)
+        pdf.ln(5)
         pdf.set_font("Arial", "B", 12)
         pdf.cell(0, 10, "Realized Profit (Stock-wise)", ln=True)
-
 
         pdf.set_font("Arial", "B", 11)
         pdf.cell(90, 8, "Stock Name", border=1, align="C")
@@ -360,7 +460,15 @@ if selected_client:
         st.subheader("📈 Realized Profit")
         st.dataframe(realized_df)
 
-
     if st.button("📄 Generate PDF Report"):
-        pdf = generate_pdf(selected_client, realized_df, unreal_df, initial_cash, invested, net_value, net_profit, net_pct)
-        st.download_button("⬇️ Download Report", data=pdf, file_name=f"{selected_client}_report.pdf", mime="application/pdf")
+        pdf = generate_pdf(
+            selected_client,
+            realized_df,
+            unreal_df,
+            ledger_balance,
+            invested,
+            realized_total,
+            unrealized
+        )
+        st.download_button("⬇️ Download Report", data=pdf, file_name=f"{selected_client}_report.pdf",
+                           mime="application/pdf")
