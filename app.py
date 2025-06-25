@@ -137,7 +137,8 @@ if selected_client:
     if st.button("Add Manual Ledger Entry"):
         add_ledger_entry(selected_client, datetime.today().date(), "Manual Adjustment", 1000.0)
         st.success("Ledger entry added.")
-        st.experimental_rerun()
+        st.rerun()
+
 
 def calculate_realized_profit(client):
     df = pd.read_sql("SELECT * FROM transactions WHERE client_name = ?", conn, params=(client,))
