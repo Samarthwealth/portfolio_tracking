@@ -43,10 +43,17 @@ c.execute('''CREATE TABLE IF NOT EXISTS ledger (
     description TEXT,
     amount REAL
 )''')
+# Ensure 'description' exists (in case it was created before adding the column)
+try:
+    c.execute("ALTER TABLE ledger ADD COLUMN description TEXT")
+    conn.commit()
+except sqlite3.OperationalError:
+    pass
+
 conn.commit()
 
 
-conn.commit()
+
 
 @st.cache_data(ttl=600)
 def get_current_price(symbol):
@@ -57,6 +64,7 @@ def get_current_price(symbol):
     except:
         return None
 
+
 def add_ledger_entry(client, date, description, amount):
     try:
         c.execute("INSERT INTO ledger (client_name, date, description, amount) VALUES (?, ?, ?, ?)",
@@ -65,26 +73,75 @@ def add_ledger_entry(client, date, description, amount):
     except sqlite3.OperationalError as e:
         st.error(f"Database error: {e}")
 
-
 def show_ledger(client):
     st.subheader("📒 Ledger Entries")
 
-    # Fetch entries
-    df = pd.read_sql("SELECT * FROM ledger WHERE client_name = ? ORDER BY date DESC", conn, params=(client,))
+    try:
+        df = pd.read_sql(
+            "SELECT ledger_id, client_name, date, description, amount FROM ledger WHERE client_name = ? ORDER BY date DESC",
+            conn, params=(client,)
+        )
+    except Exception as e:
+        st.error(f"Failed to load ledger: {e}")
+        return
 
     if not df.empty:
-        st.dataframe(df)
+        df['adjusted_amount'] = df['amount'].astype(float)
+        ledger_balance = df['adjusted_amount'].sum()
+        st.markdown(f"**Total Ledger Balance**: ₹{ledger_balance:,.2f}")
 
-        # Compute total balance correctly (Deposit adds, Withdraw subtracts)
-        df['adjusted_amount'] = df.apply(
-            lambda row: row['amount'] if row['type'].lower() == 'deposit' else -row['amount'],
-            axis=1
-        )
-        total_balance = df['adjusted_amount'].sum()
+        st.subheader("✏️ Edit or 🗑️ Delete Entries")
 
-        st.markdown(f"**Total Balance**: ₹{total_balance:,.2f}")
+        for idx, row in df.iterrows():
+            with st.expander(f"Entry #{row['ledger_id']} - {row['description']} (₹{row['amount']:,.2f})", expanded=False):
+
+                # Use a unique key suffix
+                suffix = f"{client}_{row['ledger_id']}"
+
+                new_date = st.date_input("Date", pd.to_datetime(row['date']), key=f"date_{suffix}")
+                new_desc = st.text_input("Description", row['description'], key=f"desc_{suffix}")
+                new_amount = st.number_input("Amount", value=row['amount'], key=f"amount_{suffix}")
+
+                update_col, delete_col = st.columns(2)
+
+                with update_col:
+                    if st.button("✅ Update", key=f"update_btn_{suffix}"):
+                        try:
+                            c.execute(
+                                "UPDATE ledger SET date = ?, description = ?, amount = ? WHERE ledger_id = ?",
+                                (str(new_date), new_desc, new_amount, row['ledger_id'])
+                            )
+                            conn.commit()
+                            st.success("Entry updated.")
+                            st.rerun()  # Trigger full refresh AFTER commit
+                        except Exception as e:
+                            st.error(f"Update failed: {e}")
+
+                with delete_col:
+                    if st.button("🗑️ Delete", key=f"delete_btn_{suffix}"):
+                        try:
+                            c.execute("DELETE FROM ledger WHERE ledger_id = ?", (row['ledger_id'],))
+                            conn.commit()
+                            st.warning("Entry deleted.")
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"Delete failed: {e}")
     else:
         st.info("No ledger entries available.")
+def add_ledger_entry_form(client):
+    st.subheader("➕ Add Ledger Entry")
+    with st.form(f"add_ledger_form_{client}", clear_on_submit=True):
+        date = st.date_input("Date", value=datetime.today())
+        description = st.text_input("Description")
+        amount = st.number_input("Amount (positive = deposit, negative = withdrawal)", value=0.0, step=100.0)
+        submit = st.form_submit_button("Add Entry")
+
+        if submit:
+            add_ledger_entry(client, date, description, amount)
+            st.success(f"Entry added: ₹{amount:,.2f} - {description} on {date}")
+            st.rerun()
+
+
 
 
 def delete_client(client):
@@ -93,6 +150,7 @@ def delete_client(client):
     c.execute("DELETE FROM alerts WHERE client_name = ?", (client,))
     c.execute("DELETE FROM ledger WHERE client_name = ?", (client,))
     conn.commit()
+
 
 # Sidebar: Add Client
 st.sidebar.header("➕ Add New Client")
@@ -121,31 +179,16 @@ if clients_list:
 # Main App Logic
 clients = pd.read_sql("SELECT client_name FROM clients", conn)['client_name'].tolist()
 selected_client = st.selectbox("Select Client", clients)
-# Define the function at the top (before using it)
-def add_ledger_entry_form(client):
-    st.subheader("➕ Add Ledger Entry")
-    with st.form(f"add_ledger_form_{client}", clear_on_submit=True):
-        date = st.date_input("Date", value=datetime.today())
-        description = st.text_input("Description")
-        amount = st.number_input("Amount (positive = deposit, negative = withdrawal)", value=0.0, step=100.0)
-        submit = st.form_submit_button("Add Entry")
 
-        if submit:
-            try:
-                c.execute("INSERT INTO ledger (client_name, date, description, amount) VALUES (?, ?, ?, ?)",
-                          (client, str(date), description, amount))
-                conn.commit()
-                st.success(f"Entry added: ₹{amount:,.2f} - {description} on {date}")
-                st.experimental_rerun()
-            except sqlite3.Error as e:
-                st.error(f"Failed to add ledger entry: {e}")
+
+# Define the function at the top (before using it)
 
 if selected_client:
     st.header(f"📥 Manage Portfolio for {selected_client}")
     add_ledger_entry_form(selected_client)
     # Show Ledger
     show_ledger(selected_client)
-    
+
     # Example ledger entry
     if st.button("Add Manual Ledger Entry"):
         add_ledger_entry(selected_client, datetime.today().date(), "Manual Adjustment", 1000.0)
@@ -168,6 +211,7 @@ def calculate_realized_profit(client):
             profit += p
             rows.append({"Stock Name": stock, "Realized Profit": round(p, 2)})
     return round(profit, 2), pd.DataFrame(rows)
+
 
 def calculate_unrealized_profit(client):
     df = pd.read_sql("SELECT * FROM transactions WHERE client_name = ?", conn, params=(client,))
@@ -198,17 +242,24 @@ def calculate_unrealized_profit(client):
                 })
     return pd.DataFrame(rows), round(unrealized, 2), round(invested, 2)
 
+
 st.title("📊 Stock Portfolio Tracker")
+
+
 # get ledger balance
+# def get_ledger_balance(client):
+#     df = pd.read_sql("SELECT * FROM ledger WHERE client_name = ?", conn, params=(client,))
+#     if df.empty:
+#         return 0.0
+#     deposits = df[df["type"] == "Deposit"]["amount"].sum()
+#     withdrawals = df[df["type"] == "Withdraw"]["amount"].sum()
+#     return round(deposits - withdrawals, 2)
+
 def get_ledger_balance(client):
-    df = pd.read_sql("SELECT * FROM ledger WHERE client_name = ?", conn, params=(client,))
+    df = pd.read_sql("SELECT amount FROM ledger WHERE client_name = ?", conn, params=(client,))
     if df.empty:
         return 0.0
-    deposits = df[df["type"] == "Deposit"]["amount"].sum()
-    withdrawals = df[df["type"] == "Withdraw"]["amount"].sum()
-    return round(deposits - withdrawals, 2)
-
-
+    return round(df["amount"].sum(), 2)
 
 if selected_client:
     st.header(f"📥 Add Transaction for {selected_client}")
@@ -219,8 +270,9 @@ if selected_client:
     date = st.date_input("Date")
 
     if st.button("Add Transaction"):
-        c.execute("INSERT INTO transactions (client_name, stock_name, transaction_type, quantity, price, date) VALUES (?, ?, ?, ?, ?, ?)",
-                  (selected_client, stock, t_type, qty, price, date))
+        c.execute(
+            "INSERT INTO transactions (client_name, stock_name, transaction_type, quantity, price, date) VALUES (?, ?, ?, ?, ?, ?)",
+            (selected_client, stock, t_type, qty, price, date))
         conn.commit()
         st.success(f"{t_type} added for {stock}.")
 
@@ -290,7 +342,7 @@ if selected_client:
         fig, ax = plt.subplots()
         pie_data = unreal_df.set_index("Stock Name")["Valuation"]
         ax.pie(pie_data, labels=pie_data.index,
-               autopct=lambda p: f'{p:.1f}%\n₹{p*pie_data.sum()/100:,.0f}',
+               autopct=lambda p: f'{p:.1f}%\n₹{p * pie_data.sum() / 100:,.0f}',
                startangle=90)
         ax.axis("equal")
         st.pyplot(fig)
@@ -340,6 +392,7 @@ def get_realized_profit_df(client):
             profits.append({"Stock Name": stock, "Realized Profit": round(profit, 2)})
     return pd.DataFrame(profits)
 
+
 def calculate_unrealized_profit(client):
     df = pd.read_sql("SELECT * FROM transactions WHERE client_name = ?", conn, params=(client,))
     rows = []
@@ -365,6 +418,7 @@ def calculate_unrealized_profit(client):
                     "Valuation": round(value, 2)
                 })
     return pd.DataFrame(rows), round(unrealized, 2), round(invested, 2)
+
 
 # PDF generation
 class PDF(FPDF):
@@ -464,6 +518,7 @@ Financial Summary:
     buffer.seek(0)
     return buffer
 
+
 # App UI
 
 
@@ -476,7 +531,6 @@ if selected_client:
     net_value = realized_total + unrealized + invested
     net_profit = net_value - initial_cash
     net_pct = (net_profit / initial_cash) * 100 if initial_cash > 0 else 0
-
 
     if not realized_df.empty:
         st.subheader("📈 Realized Profit")
