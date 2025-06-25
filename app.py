@@ -121,20 +121,15 @@ if clients_list:
 # Main App Logic
 clients = pd.read_sql("SELECT client_name FROM clients", conn)['client_name'].tolist()
 selected_client = st.selectbox("Select Client", clients)
-
-if selected_client:
-    st.header(f"📥 Manage Portfolio for {selected_client}")
-
-    # Show Ledger
-    show_ledger(selected_client)
-    def add_ledger_entry_form(client):
+# Define the function at the top (before using it)
+def add_ledger_entry_form(client):
     st.subheader("➕ Add Ledger Entry")
     with st.form(f"add_ledger_form_{client}", clear_on_submit=True):
         date = st.date_input("Date", value=datetime.today())
         description = st.text_input("Description")
         amount = st.number_input("Amount (positive = deposit, negative = withdrawal)", value=0.0, step=100.0)
         submit = st.form_submit_button("Add Entry")
-        
+
         if submit:
             try:
                 c.execute("INSERT INTO ledger (client_name, date, description, amount) VALUES (?, ?, ?, ?)",
@@ -145,9 +140,12 @@ if selected_client:
             except sqlite3.Error as e:
                 st.error(f"Failed to add ledger entry: {e}")
 
-    # Rest of your existing app code like transactions, alerts, insights, pdf generation...
-    # (You can append your previous implementation below this block)
-
+if selected_client:
+    st.header(f"📥 Manage Portfolio for {selected_client}")
+    add_ledger_entry_form(selected_client)
+    # Show Ledger
+    show_ledger(selected_client)
+    
     # Example ledger entry
     if st.button("Add Manual Ledger Entry"):
         add_ledger_entry(selected_client, datetime.today().date(), "Manual Adjustment", 1000.0)
