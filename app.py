@@ -58,9 +58,13 @@ def get_current_price(symbol):
         return None
 
 def add_ledger_entry(client, date, description, amount):
-    c.execute("INSERT INTO ledger (client_name, date, description, amount) VALUES (?, ?, ?, ?)",
-              (client, str(date), description, amount))
-    conn.commit()
+    try:
+        c.execute("INSERT INTO ledger (client_name, date, description, amount) VALUES (?, ?, ?, ?)",
+                  (client, str(date), description, amount))
+        conn.commit()
+    except sqlite3.OperationalError as e:
+        st.error(f"Database error: {e}")
+
 
 def show_ledger(client):
     st.subheader("📒 Ledger Entries")
