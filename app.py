@@ -127,6 +127,23 @@ if selected_client:
 
     # Show Ledger
     show_ledger(selected_client)
+    def add_ledger_entry_form(client):
+    st.subheader("➕ Add Ledger Entry")
+    with st.form(f"add_ledger_form_{client}", clear_on_submit=True):
+        date = st.date_input("Date", value=datetime.today())
+        description = st.text_input("Description")
+        amount = st.number_input("Amount (positive = deposit, negative = withdrawal)", value=0.0, step=100.0)
+        submit = st.form_submit_button("Add Entry")
+        
+        if submit:
+            try:
+                c.execute("INSERT INTO ledger (client_name, date, description, amount) VALUES (?, ?, ?, ?)",
+                          (client, str(date), description, amount))
+                conn.commit()
+                st.success(f"Entry added: ₹{amount:,.2f} - {description} on {date}")
+                st.experimental_rerun()
+            except sqlite3.Error as e:
+                st.error(f"Failed to add ledger entry: {e}")
 
     # Rest of your existing app code like transactions, alerts, insights, pdf generation...
     # (You can append your previous implementation below this block)
