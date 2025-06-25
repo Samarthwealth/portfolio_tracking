@@ -514,9 +514,11 @@ Financial Summary:
 
     # Finalize PDF
     buffer = BytesIO()
-    pdf.output(buffer)
+    pdf_bytes = pdf.output(dest='S').encode('latin1')  # get PDF as string and encode it
+    buffer.write(pdf_bytes)
     buffer.seek(0)
     return buffer
+
 
 
 # App UI
