@@ -41,15 +41,9 @@ c.execute('''CREATE TABLE IF NOT EXISTS ledger (
     client_name TEXT,
     date TEXT,
     description TEXT,
-    entry_type TEXT,  -- New column: Deposit or Withdraw
     amount REAL
-
 )''')
-try:
-    c.execute("ALTER TABLE ledger ADD COLUMN entry_type TEXT DEFAULT 'Deposit'")
-    conn.commit()
-except sqlite3.OperationalError:
-    pass  # Column already exists
+conn.commit()
 
 
 conn.commit()
