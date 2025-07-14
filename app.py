@@ -274,7 +274,18 @@ if selected_client:
             "INSERT INTO transactions (client_name, stock_name, transaction_type, quantity, price, date) VALUES (?, ?, ?, ?, ?, ?)",
             (selected_client, stock, t_type, qty, price, date))
         conn.commit()
+
+        if t_type == "Sell":
+            proceeds = qty * price
+            add_ledger_entry(
+                selected_client,
+                date,
+                f"Sell proceeds - {stock}",
+                proceeds
+            )
+
         st.success(f"{t_type} added for {stock}.")
+        st.st.rerun()
 
     df_txn = pd.read_sql("SELECT * FROM transactions WHERE client_name = ?", conn, params=(selected_client,))
     if not df_txn.empty:
