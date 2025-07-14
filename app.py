@@ -285,7 +285,7 @@ if selected_client:
             )
 
         st.success(f"{t_type} added for {stock}.")
-        st.st.rerun()
+        st.rerun()
 
     df_txn = pd.read_sql("SELECT * FROM transactions WHERE client_name = ?", conn, params=(selected_client,))
     if not df_txn.empty:
