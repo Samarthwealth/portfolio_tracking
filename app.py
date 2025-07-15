@@ -212,35 +212,49 @@ def calculate_realized_profit(client):
             rows.append({"Stock Name": stock, "Realized Profit": round(p, 2)})
     return round(profit, 2), pd.DataFrame(rows)
 
-
-def calculate_unrealized_profit(client):
-    df = pd.read_sql("SELECT * FROM transactions WHERE client_name = ?", conn, params=(client,))
-    if df.empty:
-        return pd.DataFrame(), 0, 0
-    rows = []
+def calculate_unrealized(client):
+    df = pd.read_sql("SELECT * FROM transactions WHERE client_name = ? ORDER BY date ASC, transaction_id ASC", conn, params=(client,))
     unrealized = 0
     invested = 0
+    holdings = []
+
     for stock in df['stock_name'].unique():
-        buys = df[(df['stock_name'] == stock) & (df['transaction_type'] == 'Buy')]
-        sells = df[(df['stock_name'] == stock) & (df['transaction_type'] == 'Sell')]
-        qty = buys['quantity'].sum() - sells['quantity'].sum()
-        if qty > 0:
-            avg = (buys['quantity'] * buys['price']).sum() / buys['quantity'].sum()
-            current = get_current_price(stock)
-            if current:
-                value = current * qty
-                pl = (current - avg) * qty
+        stock_df = df[df['stock_name'] == stock].copy()
+        position = 0
+        total_cost = 0
+        for idx, row in stock_df.iterrows():
+            qty = row['quantity']
+            price = row['price']
+            if row['transaction_type'] == 'Buy':
+                position += qty
+                total_cost += qty * price
+            elif row['transaction_type'] == 'Sell':
+                position -= qty
+                total_cost -= (total_cost / (position + qty)) * qty  # reduce proportionally
+
+            # Reset cost if position is zero
+            if position == 0:
+                total_cost = 0
+
+        if position > 0:
+            avg_price = total_cost / position
+            current_price = get_current_price(stock)
+            if current_price:
+                invested += avg_price * position
+                pl = (current_price - avg_price) * position
                 unrealized += pl
-                invested += avg * qty
-                rows.append({
-                    "Stock Name": stock,
-                    "Average Buy Price": round(avg, 2),
-                    "Current Market Price": current,
-                    "Quantity Held": qty,
-                    "Unrealized Profit/Loss": round(pl, 2),
-                    "Valuation": round(value, 2)
+                holdings.append({
+                    "Stock": stock,
+                    "Qty": position,
+                    "Buy Price": round(avg_price, 2),
+                    "CMP": current_price,
+                    "P/L": round(pl, 2),
+                    "Valuation": round(current_price * position, 2)
                 })
-    return pd.DataFrame(rows), round(unrealized, 2), round(invested, 2)
+
+    df_holdings = pd.DataFrame(holdings)
+    return round(unrealized, 2), round(invested, 2), df_holdings
+
 
 
 st.title("📊 Stock Portfolio Tracker")
