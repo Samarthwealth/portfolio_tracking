@@ -196,7 +196,7 @@ if selected_client:
         st.rerun()
 
 
-def calculate_realized_profit(client):
+def calculate_realized(client):
     df = pd.read_sql("SELECT * FROM transactions WHERE client_name = ?", conn, params=(client,))
     if df.empty:
         return 0, pd.DataFrame()
