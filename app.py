@@ -212,7 +212,7 @@ def calculate_realized(client):
             rows.append({"Stock Name": stock, "Realized Profit": round(p, 2)})
     return round(profit, 2), pd.DataFrame(rows)
 
-def calculate_unrealized(client):
+def calculate_unrealized_profit(client):
     df = pd.read_sql("SELECT * FROM transactions WHERE client_name = ? ORDER BY date ASC, transaction_id ASC", conn, params=(client,))
     unrealized = 0
     invested = 0
