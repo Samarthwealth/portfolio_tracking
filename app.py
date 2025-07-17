@@ -455,6 +455,7 @@ def generate_pdf(client, r_df, u_df, ledger, invested, realized, unreal):
             ["Stock", "Qty", "Avg", "CMP", "P&L", "Value"],
             [2, 1, 1.5, 1.5, 1.5, 1.5],
         )
+        pdf.ln(6)  # <<< add vertical space between table and chart
         # ---- pie chart ----
         try:
             fig, ax = plt.subplots(figsize=(3.5, 3), dpi=200)
