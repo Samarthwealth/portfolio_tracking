@@ -13,13 +13,15 @@ import numpy as np
 from contextlib import contextmanager
 
 ###############################################################################
-# DATABASE  (WAL + global write lock)
+# GLOBAL LOCK FOR SQLITE WRITES
 ###############################################################################
 _LOCK = threading.Lock()
 
+###############################################################################
+# DATABASE  (WAL + cached connection for writes)
+###############################################################################
 @st.cache_resource
 def get_conn():
-    """Return the *single* cached connection used for writes."""
     conn = sqlite3.connect("portfolio.db", timeout=20.0, isolation_level=None)
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")
@@ -37,7 +39,7 @@ def get_conn():
             transaction_type TEXT,
             quantity INTEGER,
             price REAL,
-            date TEXT);
+            date DATE);
         CREATE TABLE IF NOT EXISTS alerts (
             alert_id INTEGER PRIMARY KEY AUTOINCREMENT,
             client_name TEXT,
@@ -47,7 +49,7 @@ def get_conn():
         CREATE TABLE IF NOT EXISTS ledger (
             ledger_id INTEGER PRIMARY KEY AUTOINCREMENT,
             client_name TEXT,
-            date TEXT,
+            date DATE,
             description TEXT,
             amount REAL);
     """)
@@ -56,21 +58,18 @@ def get_conn():
 
 
 ###############################################################################
-# READ-ONLY HELPER
+# READ / WRITE HELPERS
 ###############################################################################
 def read_sql(query: str, params: tuple = ()):
-    """Open a *fresh* read-only connection for pandas."""
+    """Use a separate connection for read-only queries."""
     with sqlite3.connect("portfolio.db", timeout=10.0) as conn:
         conn.row_factory = sqlite3.Row
         return pd.read_sql(query, conn, params=params)
 
 
-###############################################################################
-# ATOMIC WRITE  (global lock)
-###############################################################################
 @contextmanager
 def _atomic_write():
-    """Ensure only one worker writes at a time."""
+    """Single-writer context manager."""
     with _LOCK:
         conn = get_conn()
         conn.execute("BEGIN")
@@ -82,14 +81,13 @@ def _atomic_write():
             raise
 
 
-def safe_insert(sql: str, params: tuple):
-    """Insert / update safely."""
+def safe_insert(sql: str, params: tuple = ()):
     with _atomic_write() as conn:
         conn.execute(sql, params)
 
 
 ###############################################################################
-# HELPERS
+# PRICE FETCHER
 ###############################################################################
 @st.cache_data(ttl=300)
 def get_current_price(symbol: str) -> float | None:
@@ -119,26 +117,17 @@ def get_ledger_balance(client):
 ###############################################################################
 def show_ledger(client):
     st.subheader("📒 Ledger Entries")
-    df = read_sql(
-        "SELECT * FROM ledger WHERE client_name = ? ORDER BY date DESC", (client,)
-    )
+    df = read_sql("SELECT * FROM ledger WHERE client_name = ? ORDER BY date DESC", (client,))
     if df.empty:
         st.info("No ledger entries.")
         return
     st.markdown(f"**Ledger Balance**: Rs. {df['amount'].sum():,.2f}")
-
     for _, row in df.iterrows():
         key = f"{client}_{row['ledger_id']}"
         with st.expander(f"{row['date']} – {row['description']} (Rs. {row['amount']:,.2f})"):
-            new_date = st.date_input(
-                "Date", pd.to_datetime(row["date"]), key=f"date_{key}"
-            )
-            new_desc = st.text_input(
-                "Description", row["description"], key=f"desc_{key}", max_chars=50
-            )
-            new_amt = st.number_input(
-                "Amount", value=float(row["amount"]), key=f"amt_{key}"
-            )
+            new_date = st.date_input("Date", pd.to_datetime(row["date"]), key=f"date_{key}")
+            new_desc = st.text_input("Description", row["description"], key=f"desc_{key}", max_chars=50)
+            new_amt = st.number_input("Amount", value=float(row["amount"]), key=f"amt_{key}")
             col1, col2 = st.columns(2)
             with col1:
                 if st.button("✏️ Update", key=f"upd_{key}"):
