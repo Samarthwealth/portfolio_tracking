@@ -9,6 +9,7 @@ from fpdf import FPDF
 from io import BytesIO
 from datetime import datetime
 import numpy as np
+import time
 
 ###############################################################################
 # DATABASE  (thread-safe, cached)
@@ -18,7 +19,6 @@ def get_conn():
     conn = sqlite3.connect("portfolio.db", check_same_thread=False, timeout=10.0)
     conn.execute("PRAGMA foreign_keys=ON")
     conn.row_factory = sqlite3.Row
-    # create tables once
     cur = conn.cursor()
     cur.executescript("""
         CREATE TABLE IF NOT EXISTS clients (
@@ -52,8 +52,25 @@ def get_conn():
     conn.commit()
     return conn
 
-conn = get_conn()
-c = conn.cursor()
+
+###############################################################################
+# RETRY-SAFE INSERT / UPDATE
+###############################################################################
+def safe_insert(sql: str, params: tuple):
+    """Insert/update with retry to avoid SQLite lock errors."""
+    retries = 3
+    for i in range(retries):
+        try:
+            with get_conn() as conn:
+                conn.execute(sql, params)
+                conn.commit()
+            return
+        except sqlite3.OperationalError as e:
+            if i == retries - 1:
+                st.error(f"Database still locked: {e}")
+                raise
+            time.sleep(0.2)
+
 
 ###############################################################################
 # HELPERS
@@ -68,19 +85,20 @@ def get_current_price(symbol: str) -> float | None:
     except Exception:
         return None
 
+
 def add_ledger_entry(client, date, description, amount):
-    try:
-        with get_conn() as conn:
-            conn.execute(
-                "INSERT INTO ledger (client_name, date, description, amount) VALUES (?, ?, ?, ?)",
-                (client, str(date), description, round(amount, 2)),
-            )
-            conn.commit()
-    except sqlite3.OperationalError as e:
-        st.error(f"Database locked: {e}")
+    safe_insert(
+        "INSERT INTO ledger (client_name, date, description, amount) VALUES (?,?,?,?)",
+        (client, str(date), description, round(amount, 2)),
+    )
+
+
 def get_ledger_balance(client):
-    df = pd.read_sql("SELECT amount FROM ledger WHERE client_name = ?", conn, params=(client,))
+    df = pd.read_sql(
+        "SELECT amount FROM ledger WHERE client_name = ?", get_conn(), params=(client,)
+    )
     return round(df["amount"].sum(), 2) if not df.empty else 0.0
+
 
 ###############################################################################
 # LEDGER UI
@@ -88,7 +106,9 @@ def get_ledger_balance(client):
 def show_ledger(client):
     st.subheader("📒 Ledger Entries")
     df = pd.read_sql(
-        "SELECT * FROM ledger WHERE client_name = ? ORDER BY date DESC", conn, params=(client,)
+        "SELECT * FROM ledger WHERE client_name = ? ORDER BY date DESC",
+        get_conn(),
+        params=(client,),
     )
     if df.empty:
         st.info("No ledger entries.")
@@ -99,25 +119,32 @@ def show_ledger(client):
     for _, row in df.iterrows():
         key = f"{client}_{row['ledger_id']}"
         with st.expander(f"{row['date']} – {row['description']} (Rs. {row['amount']:,.2f})"):
-            new_date = st.date_input("Date", pd.to_datetime(row["date"]), key=f"date_{key}")
-            new_desc = st.text_input("Description", row["description"], key=f"desc_{key}", max_chars=50)
-            new_amt = st.number_input("Amount", value=float(row["amount"]), key=f"amt_{key}")
+            new_date = st.date_input(
+                "Date", pd.to_datetime(row["date"]), key=f"date_{key}"
+            )
+            new_desc = st.text_input(
+                "Description", row["description"], key=f"desc_{key}", max_chars=50
+            )
+            new_amt = st.number_input(
+                "Amount", value=float(row["amount"]), key=f"amt_{key}"
+            )
             col1, col2 = st.columns(2)
             with col1:
                 if st.button("✏️ Update", key=f"upd_{key}"):
-                    c.execute(
+                    safe_insert(
                         "UPDATE ledger SET date=?, description=?, amount=? WHERE ledger_id=?",
                         (str(new_date), new_desc, round(new_amt, 2), row["ledger_id"]),
                     )
-                    conn.commit()
                     st.toast("✅ Entry updated")
                     st.rerun()
             with col2:
                 if st.button("🗑️ Delete", key=f"del_{key}"):
-                    c.execute("DELETE FROM ledger WHERE ledger_id=?", (row["ledger_id"],))
-                    conn.commit()
+                    safe_insert(
+                        "DELETE FROM ledger WHERE ledger_id=?", (row["ledger_id"],)
+                    )
                     st.toast("🗑️ Entry deleted")
                     st.rerun()
+
 
 def add_ledger_form(client):
     st.subheader("➕ Add Ledger Entry")
@@ -130,6 +157,7 @@ def add_ledger_form(client):
             st.toast("✅ Entry added")
             st.rerun()
 
+
 ###############################################################################
 # SIDEBAR
 ###############################################################################
@@ -139,22 +167,25 @@ with st.sidebar.form("add_client_form", clear_on_submit=True):
     new_cash = st.number_input("Initial Cash", min_value=0.0, value=100_000.0)
     if st.form_submit_button("Add Client"):
         try:
-            c.execute("INSERT INTO clients (client_name, initial_cash) VALUES (?, ?)", (new_name, new_cash))
-            conn.commit()
+            safe_insert(
+                "INSERT INTO clients (client_name, initial_cash) VALUES (?,?)",
+                (new_name, new_cash),
+            )
             add_ledger_entry(new_name, datetime.today().date(), "Initial Deposit", new_cash)
             st.toast("✅ Client created")
             st.rerun()
         except sqlite3.IntegrityError:
             st.sidebar.error("Client already exists.")
 
-clients = pd.read_sql("SELECT client_name FROM clients", conn)["client_name"].tolist()
+clients = pd.read_sql(
+    "SELECT client_name FROM clients ORDER BY client_name", get_conn()
+)["client_name"].tolist()
 if clients:
     del_client = st.sidebar.selectbox("Delete Client", clients, key="del_select")
     if st.sidebar.button("Delete", key="del_client_btn"):
         if st.sidebar.checkbox("Confirm delete?", key="confirm_del"):
             for tbl in ["clients", "transactions", "alerts", "ledger"]:
-                c.execute(f"DELETE FROM {tbl} WHERE client_name=?", (del_client,))
-            conn.commit()
+                safe_insert(f"DELETE FROM {tbl} WHERE client_name=?", (del_client,))
             st.toast("🗑️ Client deleted")
             st.rerun()
 
@@ -167,7 +198,7 @@ if not clients:
 selected = st.selectbox("Select Client", clients)
 
 ###############################################################################
-# LEDGER  (NO nested expander)
+# LEDGER
 ###############################################################################
 show_ledger(selected)
 add_ledger_form(selected)
@@ -183,15 +214,14 @@ with st.form("add_txn", clear_on_submit=True):
     price = st.number_input("Price", min_value=0.0, step=0.05)
     date = st.date_input("Date")
     if st.form_submit_button("Add Transaction"):
-        c.execute(
+        safe_insert(
             "INSERT INTO transactions (client_name, stock_name, transaction_type, quantity, price, date) VALUES (?,?,?,?,?,?)",
             (selected, stock, ttype, qty, round(price, 2), date),
         )
-        conn.commit()
         if ttype == "Sell":
             df_txn_all = pd.read_sql(
                 "SELECT * FROM transactions WHERE client_name=? AND stock_name=?",
-                conn,
+                get_conn(),
                 params=(selected, stock),
             )
             buys = df_txn_all[df_txn_all["transaction_type"] == "Buy"]
@@ -206,7 +236,9 @@ with st.form("add_txn", clear_on_submit=True):
         st.toast("✅ Transaction saved")
         st.rerun()
 
-df_txn = pd.read_sql("SELECT * FROM transactions WHERE client_name=?", conn, params=(selected,))
+df_txn = pd.read_sql(
+    "SELECT * FROM transactions WHERE client_name=?", get_conn(), params=(selected,)
+)
 if not df_txn.empty:
     st.subheader("📃 Transaction History")
     st.dataframe(df_txn, use_container_width=True)
@@ -216,16 +248,14 @@ if not df_txn.empty:
     new_price = st.number_input("Price", value=float(txn["price"]), key="ed_price")
     new_date = st.date_input("Date", value=pd.to_datetime(txn["date"]), key="ed_date")
     if st.button("Update Transaction", key=f"upd_txn_{tid}"):
-        c.execute(
+        safe_insert(
             "UPDATE transactions SET quantity=?, price=?, date=? WHERE transaction_id=?",
             (new_qty, round(new_price, 2), new_date, tid),
         )
-        conn.commit()
         st.toast("✅ Transaction updated")
         st.rerun()
     if st.button("Delete Transaction", type="secondary", key=f"del_txn_{tid}"):
-        c.execute("DELETE FROM transactions WHERE transaction_id=?", (tid,))
-        conn.commit()
+        safe_insert("DELETE FROM transactions WHERE transaction_id=?", (tid,))
         st.toast("🗑️ Transaction deleted")
         st.rerun()
 
@@ -238,15 +268,16 @@ with st.form("add_alert", clear_on_submit=True):
     tgt = st.number_input("Target", min_value=0.0, step=0.05)
     sl = st.number_input("Stop-loss", min_value=0.0, step=0.05)
     if st.form_submit_button("Save Alert"):
-        c.execute(
+        safe_insert(
             "INSERT INTO alerts (client_name, stock_name, target_price, stop_loss_price) VALUES (?,?,?,?)",
             (selected, a_stock, round(tgt, 2), round(sl, 2)),
         )
-        conn.commit()
         st.toast("✅ Alert saved")
         st.rerun()
 
-df_alerts = pd.read_sql("SELECT * FROM alerts WHERE client_name=?", conn, params=(selected,))
+df_alerts = pd.read_sql(
+    "SELECT * FROM alerts WHERE client_name=?", get_conn(), params=(selected,)
+)
 for _, r in df_alerts.iterrows():
     p = get_current_price(r["stock_name"])
     if p:
@@ -256,22 +287,17 @@ for _, r in df_alerts.iterrows():
             st.warning(f"🔻 {r['stock_name']} hit stop-loss Rs. {r['stop_loss_price']} (now Rs. {p})")
 
 ###############################################################################
-# INSIGHTS
-###############################################################################
-###############################################################################
 # INSIGHTS (FIFO)
 ###############################################################################
 def calc_profits(client):
     df = pd.read_sql(
         "SELECT * FROM transactions WHERE client_name=? ORDER BY date, transaction_id",
-        conn,
+        get_conn(),
         params=(client,),
     )
 
     realized_rows, unreal_rows = [], []
     realized_total = unreal_total = invested = 0.0
-
-    # dictionary: stock -> list of (qty, price) tuples representing current lots
     lots = {}
 
     for _, t in df.iterrows():
@@ -284,7 +310,6 @@ def calc_profits(client):
             lots[stock] = []
 
         if typ == "buy":
-            # push new lot at the end
             lots[stock].append((qty, price))
 
         elif typ == "sell":
@@ -293,12 +318,10 @@ def calc_profits(client):
             while to_sell > 0 and lots[stock]:
                 oldest_qty, oldest_price = lots[stock][0]
                 if oldest_qty <= to_sell:
-                    # consume entire lot
                     total_cost += oldest_qty * oldest_price
                     to_sell -= oldest_qty
                     lots[stock].pop(0)
                 else:
-                    # consume part of the lot
                     total_cost += to_sell * oldest_price
                     lots[stock][0] = (oldest_qty - to_sell, oldest_price)
                     to_sell = 0
@@ -306,7 +329,6 @@ def calc_profits(client):
             realized_total += realized_pl
             realized_rows.append({"Stock": stock, "Realized P&L": round(realized_pl, 2)})
 
-    # remaining lots = current holdings
     for stock, remaining_lots in lots.items():
         if not remaining_lots:
             continue
@@ -337,6 +359,8 @@ def calc_profits(client):
         round(unreal_total, 2),
         round(invested, 2),
     )
+
+
 realized_df, unreal_df, realized, unreal, invested = calc_profits(selected)
 ledger_balance = get_ledger_balance(selected)
 net_value = invested + realized + unreal
@@ -379,34 +403,25 @@ if not unreal_df.empty:
 class PDF(FPDF):
     def __init__(self):
         super().__init__(orientation="L")
-        self.set_left_margin(8)
-        self.set_right_margin(8)
+        self.set_left_margin(4)
+        self.set_right_margin(4)
 
     def header(self):
         self.set_font("Helvetica", "B", 14)
         self.cell(0, 10, "Portfolio Report", ln=True, align="C")
         self.set_font("Helvetica", "", 10)
-        self.cell(0, 10, f"Generated: {datetime.now():%d-%m-%Y }", ln=True, align="C")
-        self.ln(5)
+        self.cell(0, 8, f"Generated: {datetime.now():%d-%m-%Y}", ln=True, align="C")
+        self.ln(3)
 
     def footer(self):
         self.set_y(-15)
         self.cell(0, 10, f"Page {self.page_no()}", align="C")
 
+
 def generate_pdf(client, r_df, u_df, ledger, invested, realized, unreal):
     pdf = PDF()
     pdf.add_page()
-
-    # ---- narrower margins ----
-    pdf.set_left_margin(4)
-    pdf.set_right_margin(4)
-
-    # ---- header ----
-    pdf.set_font("Helvetica", "B", 14)
-    #pdf.cell(0, 10, "Portfolio Report", ln=True, align="C")
-    pdf.set_font("Helvetica", "", 10)
-    #pdf.cell(0, 8, f"Generated: {datetime.now():%d-%m-%Y %I:%M %p}", ln=True, align="C")
-    pdf.ln(3)
+    pdf.set_font("Helvetica", size=11)
 
     # ---- summary ----
     net_profit = realized + unreal
@@ -425,7 +440,6 @@ def generate_pdf(client, r_df, u_df, ledger, invested, realized, unreal):
     pdf.multi_cell(0, 5, summary)
     pdf.ln(3)
 
-    # ---- helper: table with full-width columns ----
     def table(df, title, headers, rel_widths):
         if df.empty:
             return
@@ -436,13 +450,13 @@ def generate_pdf(client, r_df, u_df, ledger, invested, realized, unreal):
         pdf.cell(0, 6, title, ln=True)
         pdf.set_font("Helvetica", "B", 9)
 
-        # ----- header -----
+        # header
         for h, w in zip(headers, abs_widths):
             pdf.cell(w, 5, str(h), border=1, align="C")
         pdf.ln()
         pdf.set_font("Helvetica", "", 9)
 
-        # ----- data rows -----
+        # data rows
         float_cols = df.select_dtypes(include=[np.number]).columns
         for _, row in df.iterrows():
             for val, w in zip(row, abs_widths):
@@ -451,7 +465,7 @@ def generate_pdf(client, r_df, u_df, ledger, invested, realized, unreal):
                 pdf.cell(w, 5, str(val), border=1)
             pdf.ln()
 
-        # ----- TOTAL row (only for Holdings) -----
+        # totals (only for Holdings)
         if title == "Holdings" and not df.empty:
             totals = {
                 "Stock": "Total",
@@ -466,11 +480,8 @@ def generate_pdf(client, r_df, u_df, ledger, invested, realized, unreal):
                 v = totals.get(key, "")
                 pdf.cell(w, 5, str(v), border=1, align="C")
             pdf.ln()
-            
-    # ---- realised ----
-    table(r_df, "Realized P&L", ["Stock", "P&L"], [3, 1])
 
-    # ---- holdings ----
+    table(r_df, "Realized P&L", ["Stock", "P&L"], [3, 1])
     if not u_df.empty:
         table(
             u_df,
@@ -478,8 +489,7 @@ def generate_pdf(client, r_df, u_df, ledger, invested, realized, unreal):
             ["Stock", "Qty", "Avg", "CMP", "P&L", "Value"],
             [2, 1, 1.5, 1.5, 1.5, 1.5],
         )
-        pdf.ln(6)  # <<< add vertical space between table and chart
-        # ---- pie chart ----
+        pdf.ln(6)  # space between table and pie
         try:
             fig, ax = plt.subplots(figsize=(3.5, 3), dpi=200)
             ax.pie(u_df["Value"], labels=u_df["Stock"], autopct="%1.1f%%", startangle=90)
