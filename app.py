@@ -3,31 +3,28 @@ import streamlit as st
 import pandas as pd
 import yfinance as yf
 import sqlite3
-import threading
+import time
 import matplotlib.pyplot as plt
 import os
 from fpdf import FPDF
 from io import BytesIO
 from datetime import datetime
 import numpy as np
-from contextlib import contextmanager
 
 ###############################################################################
-# GLOBAL LOCK FOR SQLITE WRITES
+# DATABASE  (WAL + retry-on-busy)
 ###############################################################################
-_LOCK = threading.Lock()
-
-###############################################################################
-# DATABASE  (WAL + cached connection for writes)
-###############################################################################
-@st.cache_resource
-def get_conn():
-    conn = sqlite3.connect("portfolio.db", timeout=20.0, isolation_level=None)
+def _conn():
+    """Fresh connection every time."""
+    conn = sqlite3.connect("portfolio.db", timeout=10.0)
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")
     conn.row_factory = sqlite3.Row
-    cur = conn.cursor()
-    cur.executescript("""
+    return conn
+
+# create tables once
+with sqlite3.connect("portfolio.db") as c:
+    c.executescript("""
         CREATE TABLE IF NOT EXISTS clients (
             client_id INTEGER PRIMARY KEY AUTOINCREMENT,
             client_name TEXT UNIQUE,
@@ -53,41 +50,10 @@ def get_conn():
             description TEXT,
             amount REAL);
     """)
-    conn.commit()
-    return conn
 
 
 ###############################################################################
-# READ / WRITE HELPERS
-###############################################################################
-def read_sql(query: str, params: tuple = ()):
-    """Use a separate connection for read-only queries."""
-    with sqlite3.connect("portfolio.db", timeout=10.0) as conn:
-        conn.row_factory = sqlite3.Row
-        return pd.read_sql(query, conn, params=params)
-
-
-@contextmanager
-def _atomic_write():
-    """Single-writer context manager."""
-    with _LOCK:
-        conn = get_conn()
-        conn.execute("BEGIN")
-        try:
-            yield conn
-            conn.execute("COMMIT")
-        except Exception:
-            conn.execute("ROLLBACK")
-            raise
-
-
-def safe_insert(sql: str, params: tuple = ()):
-    with _atomic_write() as conn:
-        conn.execute(sql, params)
-
-
-###############################################################################
-# PRICE FETCHER
+# HELPERS
 ###############################################################################
 @st.cache_data(ttl=300)
 def get_current_price(symbol: str) -> float | None:
@@ -98,6 +64,29 @@ def get_current_price(symbol: str) -> float | None:
         return round(float(last_valid), 2)
     except Exception:
         return None
+
+
+def read_sql(query: str, params: tuple = ()):
+    with sqlite3.connect("portfolio.db") as conn:
+        conn.row_factory = sqlite3.Row
+        return pd.read_sql(query, conn, params=params)
+
+
+def safe_insert(sql: str, params: tuple = ()):
+    """Retry on busy up to 3 times."""
+    retries = 3
+    for i in range(retries):
+        try:
+            with sqlite3.connect("portfolio.db") as conn:
+                conn.execute(sql, params)
+            return
+        except sqlite3.OperationalError as e:
+            if "database is locked" not in str(e).lower():
+                raise
+            if i == retries - 1:
+                st.error("Database still locked after retries.")
+                raise
+            time.sleep(0.2)
 
 
 def add_ledger_entry(client, date, description, amount):
@@ -278,76 +267,6 @@ for _, r in df_alerts.iterrows():
 ###############################################################################
 # INSIGHTS (FIFO)
 ###############################################################################
-def calc_profits(client):
-    df = read_sql(
-        "SELECT * FROM transactions WHERE client_name=? ORDER BY date, transaction_id",
-        (client,),
-    )
-
-    realized_rows, unreal_rows = [], []
-    realized_total = unreal_total = invested = 0.0
-    lots = {}
-
-    for _, t in df.iterrows():
-        stock = t["stock_name"]
-        qty = int(t["quantity"])
-        price = float(t["price"])
-        typ = t["transaction_type"].lower()
-
-        if stock not in lots:
-            lots[stock] = []
-
-        if typ == "buy":
-            lots[stock].append((qty, price))
-
-        elif typ == "sell":
-            to_sell = qty
-            total_cost = 0.0
-            while to_sell > 0 and lots[stock]:
-                oldest_qty, oldest_price = lots[stock][0]
-                if oldest_qty <= to_sell:
-                    total_cost += oldest_qty * oldest_price
-                    to_sell -= oldest_qty
-                    lots[stock].pop(0)
-                else:
-                    total_cost += to_sell * oldest_price
-                    lots[stock][0] = (oldest_qty - to_sell, oldest_price)
-                    to_sell = 0
-            realized_pl = qty * price - total_cost
-            realized_total += realized_pl
-            realized_rows.append({"Stock": stock, "Realized P&L": round(realized_pl, 2)})
-
-    for stock, remaining_lots in lots.items():
-        if not remaining_lots:
-            continue
-        total_qty = sum(q for q, _ in remaining_lots)
-        total_cost = sum(q * p for q, p in remaining_lots)
-        avg_price = total_cost / total_qty
-        cmp = get_current_price(stock)
-        if cmp:
-            value = cmp * total_qty
-            pl = (cmp - avg_price) * total_qty
-            unreal_total += pl
-            invested += total_cost
-            unreal_rows.append(
-                {
-                    "Stock": stock,
-                    "Qty": int(total_qty),
-                    "Avg": round(avg_price, 2),
-                    "CMP": cmp,
-                    "P&L": round(pl, 2),
-                    "Value": round(value, 2),
-                }
-            )
-    return (
-        pd.DataFrame(realized_rows),
-        pd.DataFrame(unreal_rows),
-        round(realized_total, 2),
-        round(unreal_total, 2),
-        round(invested, 2),
-    )
-
-
 realized_df, unreal_df, realized, unreal, invested = calc_profits(selected)
 ledger_balance = get_ledger_balance(selected)
 net_value = invested + realized + unreal
