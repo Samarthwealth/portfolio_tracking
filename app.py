@@ -399,7 +399,7 @@ def generate_pdf(client, r_df, u_df, ledger, invested, realized, unreal):
     pdf.set_font("Helvetica", "B", 14)
     #pdf.cell(0, 10, "Portfolio Report", ln=True, align="C")
     pdf.set_font("Helvetica", "", 10)
-    pdf.cell(0, 8, f"Generated: {datetime.now():%d-%m-%Y %I:%M %p}", ln=True, align="C")
+    #pdf.cell(0, 8, f"Generated: {datetime.now():%d-%m-%Y %I:%M %p}", ln=True, align="C")
     pdf.ln(3)
 
     # ---- summary ----
