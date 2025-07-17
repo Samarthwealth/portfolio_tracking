@@ -69,12 +69,15 @@ def get_current_price(symbol: str) -> float | None:
         return None
 
 def add_ledger_entry(client, date, description, amount):
-    c.execute(
-        "INSERT INTO ledger (client_name, date, description, amount) VALUES (?, ?, ?, ?)",
-        (client, str(date), description, round(amount, 2)),
-    )
-    conn.commit()
-
+    try:
+        with get_conn() as conn:
+            conn.execute(
+                "INSERT INTO ledger (client_name, date, description, amount) VALUES (?, ?, ?, ?)",
+                (client, str(date), description, round(amount, 2)),
+            )
+            conn.commit()
+    except sqlite3.OperationalError as e:
+        st.error(f"Database locked: {e}")
 def get_ledger_balance(client):
     df = pd.read_sql("SELECT amount FROM ledger WHERE client_name = ?", conn, params=(client,))
     return round(df["amount"].sum(), 2) if not df.empty else 0.0
