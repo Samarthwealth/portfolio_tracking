@@ -1,4 +1,4 @@
-# portfolio_app.py  – SQLite + WAL + retry-on-busy
+# portfolio_app.py  – SQLite thread-safe (no cached connection)
 import streamlit as st
 import pandas as pd
 import yfinance as yf
@@ -12,58 +12,8 @@ from datetime import datetime
 import numpy as np
 
 ###############################################################################
-# DATABASE  (WAL + retry-on-busy)
+# DATABASE & HELPERS  (fresh connection every call)
 ###############################################################################
-def _conn():
-    conn = sqlite3.connect("portfolio.db", timeout=10.0)
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA synchronous=NORMAL")
-    conn.row_factory = sqlite3.Row
-    return conn
-
-# create tables once
-with sqlite3.connect("portfolio.db") as c:
-    c.executescript("""
-        CREATE TABLE IF NOT EXISTS clients (
-            client_id INTEGER PRIMARY KEY AUTOINCREMENT,
-            client_name TEXT UNIQUE,
-            initial_cash REAL DEFAULT 0);
-        CREATE TABLE IF NOT EXISTS transactions (
-            transaction_id INTEGER PRIMARY KEY AUTOINCREMENT,
-            client_name TEXT,
-            stock_name TEXT,
-            transaction_type TEXT,
-            quantity INTEGER,
-            price REAL,
-            date DATE);
-        CREATE TABLE IF NOT EXISTS alerts (
-            alert_id INTEGER PRIMARY KEY AUTOINCREMENT,
-            client_name TEXT,
-            stock_name TEXT,
-            target_price REAL,
-            stop_loss_price REAL);
-        CREATE TABLE IF NOT EXISTS ledger (
-            ledger_id INTEGER PRIMARY KEY AUTOINCREMENT,
-            client_name TEXT,
-            date DATE,
-            description TEXT,
-            amount REAL);
-    """)
-
-###############################################################################
-# HELPERS
-###############################################################################
-@st.cache_data(ttl=300)
-def get_current_price(symbol: str) -> float | None:
-    try:
-        ticker = yf.Ticker(symbol + ".NS")
-        data = ticker.history(period="5d")
-        last_valid = data["Close"].dropna().iloc[-1]
-        return round(float(last_valid), 2)
-    except Exception:
-        return None
-
-
 def read_sql(query: str, params: tuple = ()):
     with sqlite3.connect("portfolio.db") as conn:
         conn.row_factory = sqlite3.Row
@@ -97,6 +47,50 @@ def get_ledger_balance(client):
     df = read_sql("SELECT amount FROM ledger WHERE client_name = ?", (client,))
     return round(df["amount"].sum(), 2) if not df.empty else 0.0
 
+
+@st.cache_data(ttl=300)
+def get_current_price(symbol: str) -> float | None:
+    try:
+        ticker = yf.Ticker(symbol + ".NS")
+        data = ticker.history(period="5d")
+        last_valid = data["Close"].dropna().iloc[-1]
+        return round(float(last_valid), 2)
+    except Exception:
+        return None
+
+
+###############################################################################
+# INITIALISE TABLES
+###############################################################################
+with sqlite3.connect("portfolio.db") as conn:
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS clients (
+            client_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            client_name TEXT UNIQUE,
+            initial_cash REAL DEFAULT 0);
+        CREATE TABLE IF NOT EXISTS transactions (
+            transaction_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            client_name TEXT,
+            stock_name TEXT,
+            transaction_type TEXT,
+            quantity INTEGER,
+            price REAL,
+            date DATE);
+        CREATE TABLE IF NOT EXISTS alerts (
+            alert_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            client_name TEXT,
+            stock_name TEXT,
+            target_price REAL,
+            stop_loss_price REAL);
+        CREATE TABLE IF NOT EXISTS ledger (
+            ledger_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            client_name TEXT,
+            date DATE,
+            description TEXT,
+            amount REAL);
+    """)
 
 ###############################################################################
 # LEDGER UI
@@ -140,7 +134,6 @@ def add_ledger_form(client):
             add_ledger_entry(client, date, desc, amt)
             st.toast("✅ Entry added")
             st.rerun()
-
 
 ###############################################################################
 # SIDEBAR
@@ -266,7 +259,7 @@ for _, r in df_alerts.iterrows():
 ###############################################################################
 def calc_profits(client):
     df = read_sql(
-        "SELECT * FROM transactions WHERE client_name=%s ORDER BY date, transaction_id",
+        "SELECT * FROM transactions WHERE client_name=? ORDER BY date, transaction_id",
         (client,),
     )
 
@@ -308,7 +301,7 @@ def calc_profits(client):
             continue
         total_qty = sum(q for q, _ in remaining_lots)
         total_cost = sum(q * p for q, p in remaining_lots)
-        avg_price = total_cost / total_qty if total_qty else 0.0
+        avg_price = total_cost / total_qty
         cmp = get_current_price(stock)
         if cmp:
             value = cmp * total_qty
@@ -370,7 +363,7 @@ if not unreal_df.empty:
     st.pyplot(fig)
 
 ###############################################################################
-# PDF  – unchanged
+# PDF
 ###############################################################################
 class PDF(FPDF):
     def __init__(self):
