@@ -19,6 +19,7 @@ _LOCK = threading.Lock()
 
 @st.cache_resource
 def get_conn():
+    """Return the *single* cached connection used for writes."""
     conn = sqlite3.connect("portfolio.db", timeout=20.0, isolation_level=None)
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")
@@ -55,6 +56,16 @@ def get_conn():
 
 
 ###############################################################################
+# READ-ONLY HELPER
+###############################################################################
+def read_sql(query: str, params: tuple = ()):
+    """Open a *fresh* read-only connection for pandas."""
+    with sqlite3.connect("portfolio.db", timeout=10.0) as conn:
+        conn.row_factory = sqlite3.Row
+        return pd.read_sql(query, conn, params=params)
+
+
+###############################################################################
 # ATOMIC WRITE  (global lock)
 ###############################################################################
 @contextmanager
@@ -72,6 +83,7 @@ def _atomic_write():
 
 
 def safe_insert(sql: str, params: tuple):
+    """Insert / update safely."""
     with _atomic_write() as conn:
         conn.execute(sql, params)
 
@@ -98,9 +110,7 @@ def add_ledger_entry(client, date, description, amount):
 
 
 def get_ledger_balance(client):
-    df = pd.read_sql(
-        "SELECT amount FROM ledger WHERE client_name = ?", get_conn(), params=(client,)
-    )
+    df = read_sql("SELECT amount FROM ledger WHERE client_name = ?", (client,))
     return round(df["amount"].sum(), 2) if not df.empty else 0.0
 
 
@@ -109,15 +119,12 @@ def get_ledger_balance(client):
 ###############################################################################
 def show_ledger(client):
     st.subheader("📒 Ledger Entries")
-    df = pd.read_sql(
-        "SELECT * FROM ledger WHERE client_name = ? ORDER BY date DESC",
-        get_conn(),
-        params=(client,),
+    df = read_sql(
+        "SELECT * FROM ledger WHERE client_name = ? ORDER BY date DESC", (client,)
     )
     if df.empty:
         st.info("No ledger entries.")
         return
-
     st.markdown(f"**Ledger Balance**: Rs. {df['amount'].sum():,.2f}")
 
     for _, row in df.iterrows():
@@ -179,9 +186,7 @@ with st.sidebar.form("add_client_form", clear_on_submit=True):
         except sqlite3.IntegrityError:
             st.sidebar.error("Client already exists.")
 
-clients = pd.read_sql(
-    "SELECT client_name FROM clients ORDER BY client_name", get_conn()
-)["client_name"].tolist()
+clients = read_sql("SELECT client_name FROM clients ORDER BY client_name")["client_name"].tolist()
 if clients:
     del_client = st.sidebar.selectbox("Delete Client", clients, key="del_select")
     if st.sidebar.button("Delete", key="del_client_btn"):
@@ -221,10 +226,9 @@ with st.form("add_txn", clear_on_submit=True):
             (selected, stock, ttype, qty, round(price, 2), date),
         )
         if ttype == "Sell":
-            df_txn_all = pd.read_sql(
+            df_txn_all = read_sql(
                 "SELECT * FROM transactions WHERE client_name=? AND stock_name=?",
-                get_conn(),
-                params=(selected, stock),
+                (selected, stock),
             )
             buys = df_txn_all[df_txn_all["transaction_type"] == "Buy"]
             avg_cost = (
@@ -238,9 +242,7 @@ with st.form("add_txn", clear_on_submit=True):
         st.toast("✅ Transaction saved")
         st.rerun()
 
-df_txn = pd.read_sql(
-    "SELECT * FROM transactions WHERE client_name=?", get_conn(), params=(selected,)
-)
+df_txn = read_sql("SELECT * FROM transactions WHERE client_name=?", (selected,))
 if not df_txn.empty:
     st.subheader("📃 Transaction History")
     st.dataframe(df_txn, use_container_width=True)
@@ -277,9 +279,7 @@ with st.form("add_alert", clear_on_submit=True):
         st.toast("✅ Alert saved")
         st.rerun()
 
-df_alerts = pd.read_sql(
-    "SELECT * FROM alerts WHERE client_name=?", get_conn(), params=(selected,)
-)
+df_alerts = read_sql("SELECT * FROM alerts WHERE client_name=?", (selected,))
 for _, r in df_alerts.iterrows():
     p = get_current_price(r["stock_name"])
     if p:
@@ -289,9 +289,78 @@ for _, r in df_alerts.iterrows():
             st.warning(f"🔻 {r['stock_name']} hit stop-loss Rs. {r['stop_loss_price']} (now Rs. {p})")
 
 ###############################################################################
-# INSIGHTS (FIFO)  – unchanged
+# INSIGHTS (FIFO)
 ###############################################################################
-# calc_profits is exactly as given earlier
+def calc_profits(client):
+    df = read_sql(
+        "SELECT * FROM transactions WHERE client_name=? ORDER BY date, transaction_id",
+        (client,),
+    )
+
+    realized_rows, unreal_rows = [], []
+    realized_total = unreal_total = invested = 0.0
+    lots = {}
+
+    for _, t in df.iterrows():
+        stock = t["stock_name"]
+        qty = int(t["quantity"])
+        price = float(t["price"])
+        typ = t["transaction_type"].lower()
+
+        if stock not in lots:
+            lots[stock] = []
+
+        if typ == "buy":
+            lots[stock].append((qty, price))
+
+        elif typ == "sell":
+            to_sell = qty
+            total_cost = 0.0
+            while to_sell > 0 and lots[stock]:
+                oldest_qty, oldest_price = lots[stock][0]
+                if oldest_qty <= to_sell:
+                    total_cost += oldest_qty * oldest_price
+                    to_sell -= oldest_qty
+                    lots[stock].pop(0)
+                else:
+                    total_cost += to_sell * oldest_price
+                    lots[stock][0] = (oldest_qty - to_sell, oldest_price)
+                    to_sell = 0
+            realized_pl = qty * price - total_cost
+            realized_total += realized_pl
+            realized_rows.append({"Stock": stock, "Realized P&L": round(realized_pl, 2)})
+
+    for stock, remaining_lots in lots.items():
+        if not remaining_lots:
+            continue
+        total_qty = sum(q for q, _ in remaining_lots)
+        total_cost = sum(q * p for q, p in remaining_lots)
+        avg_price = total_cost / total_qty
+        cmp = get_current_price(stock)
+        if cmp:
+            value = cmp * total_qty
+            pl = (cmp - avg_price) * total_qty
+            unreal_total += pl
+            invested += total_cost
+            unreal_rows.append(
+                {
+                    "Stock": stock,
+                    "Qty": int(total_qty),
+                    "Avg": round(avg_price, 2),
+                    "CMP": cmp,
+                    "P&L": round(pl, 2),
+                    "Value": round(value, 2),
+                }
+            )
+    return (
+        pd.DataFrame(realized_rows),
+        pd.DataFrame(unreal_rows),
+        round(realized_total, 2),
+        round(unreal_total, 2),
+        round(invested, 2),
+    )
+
+
 realized_df, unreal_df, realized, unreal, invested = calc_profits(selected)
 ledger_balance = get_ledger_balance(selected)
 net_value = invested + realized + unreal
@@ -328,7 +397,7 @@ if not unreal_df.empty:
     st.pyplot(fig)
 
 ###############################################################################
-# PDF  – unchanged
+# PDF
 ###############################################################################
 class PDF(FPDF):
     def __init__(self):
