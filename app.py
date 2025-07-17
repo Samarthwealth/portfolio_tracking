@@ -423,7 +423,6 @@ def generate_pdf(client, r_df, u_df, ledger, invested, realized, unreal):
     def table(df, title, headers, rel_widths):
         if df.empty:
             return
-        # total printable width
         usable = pdf.w - pdf.l_margin - pdf.r_margin
         abs_widths = [usable * r / sum(rel_widths) for r in rel_widths]
 
@@ -431,11 +430,13 @@ def generate_pdf(client, r_df, u_df, ledger, invested, realized, unreal):
         pdf.cell(0, 6, title, ln=True)
         pdf.set_font("Helvetica", "B", 9)
 
+        # ----- header -----
         for h, w in zip(headers, abs_widths):
             pdf.cell(w, 5, str(h), border=1, align="C")
         pdf.ln()
         pdf.set_font("Helvetica", "", 9)
 
+        # ----- data rows -----
         float_cols = df.select_dtypes(include=[np.number]).columns
         for _, row in df.iterrows():
             for val, w in zip(row, abs_widths):
@@ -444,6 +445,22 @@ def generate_pdf(client, r_df, u_df, ledger, invested, realized, unreal):
                 pdf.cell(w, 5, str(val), border=1)
             pdf.ln()
 
+        # ----- TOTAL row (only for Holdings) -----
+        if title == "Holdings" and not df.empty:
+            totals = {
+                "Stock": "Total",
+                "Qty": str(int(df["Qty"].sum())),
+                "Avg": "",
+                "CMP": "",
+                "P&L": f"{df['P&L'].sum():.2f}",
+                "Value": f"{df['Value'].sum():.2f}",
+            }
+            pdf.set_font("Helvetica", "B", 9)
+            for key, w in zip(headers, abs_widths):
+                v = totals.get(key, "")
+                pdf.cell(w, 5, str(v), border=1, align="C")
+            pdf.ln()
+            
     # ---- realised ----
     table(r_df, "Realized P&L", ["Stock", "P&L"], [3, 1])
 
