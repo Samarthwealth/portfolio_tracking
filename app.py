@@ -380,7 +380,7 @@ class PDF(FPDF):
         self.set_font("Helvetica", "B", 14)
         self.cell(0, 10, "Portfolio Report", ln=True, align="C")
         self.set_font("Helvetica", "", 10)
-        self.cell(0, 10, f"Generated: {datetime.now():%d-%m-%Y %I:%M %p}", ln=True, align="C")
+        self.cell(0, 10, f"Generated: {date.now():%d-%m-%Y %I:%M %p}", ln=True, align="C")
         self.ln(5)
 
     def footer(self):
