@@ -1,4 +1,4 @@
-# portfolio_app.py
+# portfolio_app.py  – SQLite + WAL + retry-on-busy
 import streamlit as st
 import pandas as pd
 import yfinance as yf
@@ -15,7 +15,6 @@ import numpy as np
 # DATABASE  (WAL + retry-on-busy)
 ###############################################################################
 def _conn():
-    """Fresh connection every time."""
     conn = sqlite3.connect("portfolio.db", timeout=10.0)
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")
@@ -51,7 +50,6 @@ with sqlite3.connect("portfolio.db") as c:
             amount REAL);
     """)
 
-
 ###############################################################################
 # HELPERS
 ###############################################################################
@@ -73,7 +71,6 @@ def read_sql(query: str, params: tuple = ()):
 
 
 def safe_insert(sql: str, params: tuple = ()):
-    """Retry on busy up to 3 times."""
     retries = 3
     for i in range(retries):
         try:
@@ -267,6 +264,76 @@ for _, r in df_alerts.iterrows():
 ###############################################################################
 # INSIGHTS (FIFO)
 ###############################################################################
+def calc_profits(client):
+    df = read_sql(
+        "SELECT * FROM transactions WHERE client_name=%s ORDER BY date, transaction_id",
+        (client,),
+    )
+
+    realized_rows, unreal_rows = [], []
+    realized_total = unreal_total = invested = 0.0
+    lots = {}
+
+    for _, t in df.iterrows():
+        stock = t["stock_name"]
+        qty = int(t["quantity"])
+        price = float(t["price"])
+        typ = t["transaction_type"].lower()
+
+        if stock not in lots:
+            lots[stock] = []
+
+        if typ == "buy":
+            lots[stock].append((qty, price))
+
+        elif typ == "sell":
+            to_sell = qty
+            total_cost = 0.0
+            while to_sell > 0 and lots[stock]:
+                oldest_qty, oldest_price = lots[stock][0]
+                if oldest_qty <= to_sell:
+                    total_cost += oldest_qty * oldest_price
+                    to_sell -= oldest_qty
+                    lots[stock].pop(0)
+                else:
+                    total_cost += to_sell * oldest_price
+                    lots[stock][0] = (oldest_qty - to_sell, oldest_price)
+                    to_sell = 0
+            realized_pl = qty * price - total_cost
+            realized_total += realized_pl
+            realized_rows.append({"Stock": stock, "Realized P&L": round(realized_pl, 2)})
+
+    for stock, remaining_lots in lots.items():
+        if not remaining_lots:
+            continue
+        total_qty = sum(q for q, _ in remaining_lots)
+        total_cost = sum(q * p for q, p in remaining_lots)
+        avg_price = total_cost / total_qty if total_qty else 0.0
+        cmp = get_current_price(stock)
+        if cmp:
+            value = cmp * total_qty
+            pl = (cmp - avg_price) * total_qty
+            unreal_total += pl
+            invested += total_cost
+            unreal_rows.append(
+                {
+                    "Stock": stock,
+                    "Qty": int(total_qty),
+                    "Avg": round(avg_price, 2),
+                    "CMP": cmp,
+                    "P&L": round(pl, 2),
+                    "Value": round(value, 2),
+                }
+            )
+    return (
+        pd.DataFrame(realized_rows),
+        pd.DataFrame(unreal_rows),
+        round(realized_total, 2),
+        round(unreal_total, 2),
+        round(invested, 2),
+    )
+
+
 realized_df, unreal_df, realized, unreal, invested = calc_profits(selected)
 ledger_balance = get_ledger_balance(selected)
 net_value = invested + realized + unreal
@@ -303,7 +370,7 @@ if not unreal_df.empty:
     st.pyplot(fig)
 
 ###############################################################################
-# PDF
+# PDF  – unchanged
 ###############################################################################
 class PDF(FPDF):
     def __init__(self):
