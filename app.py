@@ -11,46 +11,49 @@ from datetime import datetime
 import numpy as np
 
 ###############################################################################
-# DATABASE
+# DATABASE  (thread-safe, cached)
 ###############################################################################
 @st.cache_resource
 def get_conn():
-    conn = sqlite3.connect("portfolio.db", check_same_thread=False)
+    conn = sqlite3.connect("portfolio.db", check_same_thread=False, timeout=10.0)
     conn.execute("PRAGMA foreign_keys=ON")
     conn.row_factory = sqlite3.Row
+    # create tables once
+    cur = conn.cursor()
+    cur.executescript("""
+        CREATE TABLE IF NOT EXISTS clients (
+            client_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            client_name TEXT UNIQUE,
+            initial_cash REAL DEFAULT 0);
+
+        CREATE TABLE IF NOT EXISTS transactions (
+            transaction_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            client_name TEXT,
+            stock_name TEXT,
+            transaction_type TEXT,
+            quantity INTEGER,
+            price REAL,
+            date TEXT);
+
+        CREATE TABLE IF NOT EXISTS alerts (
+            alert_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            client_name TEXT,
+            stock_name TEXT,
+            target_price REAL,
+            stop_loss_price REAL);
+
+        CREATE TABLE IF NOT EXISTS ledger (
+            ledger_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            client_name TEXT,
+            date TEXT,
+            description TEXT,
+            amount REAL);
+    """)
+    conn.commit()
     return conn
 
 conn = get_conn()
 c = conn.cursor()
-
-for ddl in [
-    """CREATE TABLE IF NOT EXISTS clients (
-         client_id INTEGER PRIMARY KEY AUTOINCREMENT,
-         client_name TEXT UNIQUE,
-         initial_cash REAL DEFAULT 0)""",
-    """CREATE TABLE IF NOT EXISTS transactions (
-         transaction_id INTEGER PRIMARY KEY AUTOINCREMENT,
-         client_name TEXT,
-         stock_name TEXT,
-         transaction_type TEXT,
-         quantity INTEGER,
-         price REAL,
-         date TEXT)""",
-    """CREATE TABLE IF NOT EXISTS alerts (
-         alert_id INTEGER PRIMARY KEY AUTOINCREMENT,
-         client_name TEXT,
-         stock_name TEXT,
-         target_price REAL,
-         stop_loss_price REAL)""",
-    """CREATE TABLE IF NOT EXISTS ledger (
-         ledger_id INTEGER PRIMARY KEY AUTOINCREMENT,
-         client_name TEXT,
-         date TEXT,
-         description TEXT,
-         amount REAL)""",
-]:
-    c.execute(ddl)
-conn.commit()
 
 ###############################################################################
 # HELPERS
