@@ -220,11 +220,9 @@ with st.form("add_txn", clear_on_submit=True):
                 (selected, stock),
             )
             buys = df_txn_all[df_txn_all["transaction_type"] == "Buy"]
-            avg_cost = (
-                (buys["quantity"] * buys["price"]).sum() / buys["quantity"].sum()
-                if not buys.empty
-                else 0.0
-            )
+            total_qty = buys["quantity"].sum()
+            total_cost = (buys["quantity"] * buys["price"]).sum()
+            avg_cost = total_cost / total_qty if total_qty else 0.0
             proceeds = qty * price
             add_ledger_entry(selected, date, f"Sell {stock} {qty}@", proceeds)
             add_ledger_entry(selected, date, f"COGS {stock} {qty}@", -round(avg_cost * qty, 2))
